@@ -301,6 +301,8 @@ def remote_minimaxh3_image_and_reference_to_video(payload):
 
     latent, frame_count = _empty_av_latent(width, height, length)
 
+    torch.set_float32_matmul_precision("high")
+
     # ---------- fl2va: first/last keyframes ----------
     images = []
     keyframes = []
@@ -377,6 +379,8 @@ def remote_minimaxh3_image_and_reference_to_video(payload):
         ref_items.append({"type": "audio"})
         ref_blocks.append({"kind": "audio", "ref_audio_t": ref_audio_t, "audio_latent": audio_latent})
 
+    torch.set_float32_matmul_precision("highest")
+
     # ---------- tokenize + encode (both keyframe images and refs at once) ----------
     # Keep reference numbering stable, then include keyframes in the vision context.
     encoder_items = ref_items + [{"type": "image", "data": image} for image in images]
@@ -451,6 +455,31 @@ def remote_minimaxh3_vae_decode_video(payload):
         "height": height,
         "data": data,
     }
+
+from PIL import Image
+import os
+@PromptServer.instance.routes.post("/icern/save__image_to_disk")
+@remote_binary_endpoint("POST", "/icern/save__image_to_disk", full_mm_precision=False)
+def local_save_to_disk(payload):
+    images: typing.List[bytes] = payload["images"]
+    filename_prefix = payload["filename_prefix"]
+    width0 = payload["width0"]
+    height0 = payload["height0"]
+    metadata = payload["metadata"]
+    compress_level = payload["compress_level"]
+
+    output_dir = folder_paths.get_output_directory()
+    full_output_folder, filename, counter, subfolder, filename_prefix = folder_paths.get_save_image_path(filename_prefix, utput_dir, width0, height0)
+
+    for (batch_number, image) in enumerate(images):
+        buf = io.BytesIO()
+        buf.write(image)
+        img = Image.open(buf)
+        filename_with_batch_num = filename.replace("%batch_num%", str(batch_number))
+        file = f"{filename_with_batch_num}_{counter:05}_.png"
+        img.save(os.path.join(full_output_folder, file), pnginfo=metadata, compress_level=compress_level)
+        counter += 1
+    return None
 
 NODE_CLASS_MAPPINGS = {}
 NODE_DISPLAY_NAME_MAPPINGS = {}

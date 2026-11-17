@@ -351,13 +351,21 @@ class RemoteVAELoader:
 
 from comfy_extras.nodes_minimax_h3 import (
     _empty_av_latent,
+    _resize,
+    _encode_ref_audio,
+    adapt_canvas,
+    CANVAS_MULTIPLE,
+    REF_IMAGE_SHORT_EDGE,
+    FPS,
 )
+import math
+
 class RemoteMiniMaxH3ImageAndReferenceToVideo(io.ComfyNode):
     @classmethod
     def define_schema(cls):
         return io.Schema(
             node_id="RemoteMiniMaxH3ImageAndReferenceToVideo",
-            display_name="Remote MiniMax H3 Image + Reference to Video",
+            display_name="Remote/Local MiniMax H3 Image + Reference to Video",
             category="IceRemoteNode",
             inputs=[
                 io.Clip.Input("clip"),
@@ -430,24 +438,117 @@ class RemoteMiniMaxH3ImageAndReferenceToVideo(io.ComfyNode):
             ],
             outputs=[io.Conditioning.Output(display_name="positive"), io.Latent.Output()],
         )
-
+    
     @classmethod
-    def execute(
-        cls, clip, vae, timeout_seconds, audio_vae, prompt, width, height, length,
+    def execute_local(
+        cls, clip, vae, audio_vae, prompt, width, height, length,
         first_frame=None, last_frame=None,
         ref_image_size="match",
         ref_images=None, ref_videos=None, ref_video_audios=None, ref_audios=None,
     ) -> io.NodeOutput:
-        clip_icern_info = getattr(clip, "icern_info", None)
-        if clip_icern_info is None: raise ValueError(f"Require a remote clip")
-        vae_icern_info = getattr(vae, "icern_info", None)
-        if vae_icern_info is None: raise ValueError(f"Require a remote vae")
-        audio_icern_info = getattr(audio_vae, "icern_info", None)
-        if audio_icern_info is None: raise ValueError(f"Require a remote audio vae")
-        server_url = clip_icern_info["url"]
-        if server_url != vae_icern_info["url"] or server_url != audio_icern_info["url"]:
-            raise ValueError(f"Require a matched remote url: clip({server_url}), vae({vae_icern_info['url']}), audio_vae({vae_icern_info['url']})")
-        
+        latent, frame_count = _empty_av_latent(width, height, length)
+
+        # ---------- fl2va: first/last keyframes ----------
+        images = []
+        keyframes = []
+        if first_frame is not None:
+            # geometry anchor: plain stretch to canvas
+            img = _resize(first_frame[:1], width, height, "disabled")
+            images.append(img)
+            keyframes.append({"resolved_frame_index": 0, "image": img})
+        if last_frame is not None:
+            # follower: aspect-preserving cover-crop
+            img = _resize(last_frame[:1], width, height, "center")
+            images.append(img)
+            keyframes.append({"resolved_frame_index": frame_count - 1, "image": img})
+
+        # ---------- ref2va: images / videos / audio references ----------
+        ref_items = []   # for the tokenizer presentation, in request order
+        ref_blocks = []  # for the DiT payload, same order
+
+        for img in (ref_images or {}).values():
+            if img is None:
+                continue
+            h, w = img.shape[1], img.shape[2]
+            if ref_image_size == "match":
+                scale = min(1.0, math.sqrt((width * height) / (w * h)))
+            else:
+                scale = min(1.0, REF_IMAGE_SHORT_EDGE / min(w, h))
+            tw = max(CANVAS_MULTIPLE, round(w * scale / CANVAS_MULTIPLE) * CANVAS_MULTIPLE)
+            th = max(CANVAS_MULTIPLE, round(h * scale / CANVAS_MULTIPLE) * CANVAS_MULTIPLE)
+            resized = _resize(img[:1], tw, th, "disabled")
+            z = vae.encode(resized)
+            ref_items.append({"type": "image", "data": resized})
+            ref_blocks.append({"kind": "image", "latent_h": th // 16, "latent_w": tw // 16, "latent": z})
+
+        ref_video_audios = ref_video_audios or {}
+        for name, video_frames in (ref_videos or {}).items():
+            if video_frames is None:
+                continue
+            soundtrack = ref_video_audios.get("ref_video_audio_" + name.rsplit("_", 1)[-1])
+            vh, vw = video_frames.shape[1], video_frames.shape[2]
+            cw, ch = adapt_canvas(vw, vh)
+            if vw * vh < cw * ch:
+                cw = max(CANVAS_MULTIPLE, round(vw / CANVAS_MULTIPLE) * CANVAS_MULTIPLE)
+                ch = max(CANVAS_MULTIPLE, round(vh / CANVAS_MULTIPLE) * CANVAS_MULTIPLE)
+            frames = _resize(video_frames, cw, ch, "disabled")
+            if frames.shape[0] > frame_count:
+                frames = frames[:frame_count]
+            n = frames.shape[0]
+            if n < 5:
+                raise ValueError("MiniMax H3 reference videos need at least 5 frames (~0.2s at 24 fps)")
+            while n % 17 != 5:
+                n -= 1
+            frames = frames[:n]
+            z = vae.encode(frames)
+            audio_latent, ref_audio_t = (None, 0)
+            if soundtrack is not None:
+                audio_latent, ref_audio_t = _encode_ref_audio(audio_vae, soundtrack)
+                ref_items.append({"type": "audio"})
+            sample_idx = list(range(0, frames.shape[0], FPS // 2))
+            qwen_frames = frames[sample_idx]
+            ref_items.append({
+                "type": "video", "data": qwen_frames,
+                "timestamps": [i / 2.0 for i in range(len(sample_idx))],
+            })
+            ref_blocks.append({
+                "kind": "video_audio" if ref_audio_t else "video",
+                "latent_t": z.shape[2], "latent_h": ch // 16, "latent_w": cw // 16,
+                "ref_audio_t": ref_audio_t, "latent": z, "audio_latent": audio_latent,
+            })
+
+        for audio in (ref_audios or {}).values():
+            if audio is None:
+                continue
+            audio_latent, ref_audio_t = _encode_ref_audio(audio_vae, audio)
+            ref_items.append({"type": "audio"})
+            ref_blocks.append({"kind": "audio", "ref_audio_t": ref_audio_t, "audio_latent": audio_latent})
+
+        # ---------- tokenize + encode (both keyframe images and refs at once) ----------
+        # Keep reference numbering stable, then include keyframes in the vision context.
+        encoder_items = ref_items + [{"type": "image", "data": image} for image in images]
+        tokens = clip.tokenize(prompt, minimax_ref_items=encoder_items)
+        cond = clip.encode_from_tokens_scheduled(tokens)
+
+        payload = {}
+        if keyframes:
+            for kf in keyframes:
+                kf["latent"] = vae.encode(kf.pop("image"))
+            payload["minimax_keyframes"] = keyframes
+        if ref_blocks:
+            payload["minimax_refs"] = ref_blocks
+        if payload:
+            cond = node_helpers.conditioning_set_values(cond, payload)
+
+        return io.NodeOutput(cond, latent)
+    
+    @classmethod
+    def execute_remote(
+        cls, clip_icern_info, vae_icern_info, audio_icern_info, server_url, timeout_seconds, prompt, width, height, length,
+        first_frame=None, last_frame=None,
+        ref_image_size="match",
+        ref_images=None, ref_videos=None, ref_video_audios=None, ref_audios=None,
+    ) -> io.NodeOutput:
         payload = {
             "clip": clip_icern_info,
             "vae": vae_icern_info,
@@ -476,6 +577,26 @@ class RemoteMiniMaxH3ImageAndReferenceToVideo(io.ComfyNode):
         if ret:
             cond = node_helpers.conditioning_set_values(cond, ret)
         return io.NodeOutput(cond, latent)
+
+    @classmethod
+    def execute(
+        cls, clip, vae, timeout_seconds, audio_vae, prompt, width, height, length,
+        first_frame=None, last_frame=None,
+        ref_image_size="match",
+        ref_images=None, ref_videos=None, ref_video_audios=None, ref_audios=None,
+    ) -> io.NodeOutput:
+        clip_icern_info = getattr(clip, "icern_info", None)
+        vae_icern_info = getattr(vae, "icern_info", None)
+        audio_icern_info = getattr(audio_vae, "icern_info", None)
+        if clip_icern_info is None and vae_icern_info is None and audio_icern_info is None:
+            return cls.execute_local(clip, vae, audio_vae, prompt, width, height, length, first_frame, last_frame, ref_image_size, ref_images, ref_videos, ref_video_audios)
+        if clip_icern_info is not None and vae_icern_info is not None and audio_icern_info is not None:
+            server_url = clip_icern_info["url"]
+            if server_url != vae_icern_info["url"] or server_url != audio_icern_info["url"]:
+                raise ValueError(f"Require a matched remote url: clip({server_url}), vae({vae_icern_info['url']}), audio_vae({vae_icern_info['url']})")
+            return cls.execute_remote(clip_icern_info, vae_icern_info, audio_icern_info, server_url, timeout_seconds, prompt, width, height, length, first_frame, last_frame, ref_image_size, ref_images, ref_videos, ref_video_audios)
+        raise ValueError(f"Require clip/vae/audio_vae are all remote or all local")
+
 
 from comfy_api.latest._input_impl.video_types import VideoFromComponents
 from fractions import Fraction
@@ -570,15 +691,90 @@ class RemoteVAEDecodeVideo(io.ComfyNode):
             )
         )
 
+import json
+import folder_paths
+from PIL.PngImagePlugin import PngInfo
+from PIL import Image
+import numpy as np
+class SaveImageToRemoteDisk():
+    def __init__(self):
+        self.output_dir = folder_paths.get_output_directory()
+        self.type = "output"
+        self.prefix_append = ""
+        self.compress_level = 4
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "images": ("IMAGE", {"tooltip": "The images to save."}),
+                "server_url": ("STRING", {"default": "http://127.0.0.1:8189"}),
+                "server_filename_prefix": ("STRING", {
+                    "default": "%date:yyyy-MM-dd%/Comfy",
+                    "tooltip": "The prefix for the file to save. This may include formatting information such as %date:yyyy-MM-dd% or %Empty Latent Image.width% to include values from nodes."
+                }),
+                "timeout_seconds": ("INT", {"default": 300, "min": 1, "max": 3600}),
+            },
+            "hidden": {
+                "prompt": "PROMPT", "extra_pnginfo": "EXTRA_PNGINFO"
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("images",)
+    FUNCTION = "save_images"
+
+    OUTPUT_NODE = True
+
+    CATEGORY = "IceRemoteNode"
+
+    def save_images(self, images, server_url, server_filename_prefix="ComfyUI", timeout_seconds=300, prompt=None, extra_pnginfo=None):
+        metadata = None
+        from comfy.cli_args import args
+        if not args.disable_metadata:
+            metadata = PngInfo()
+            if prompt is not None:
+                metadata.add_text("prompt", json.dumps(prompt))
+            if extra_pnginfo is not None:
+                for x in extra_pnginfo:
+                    metadata.add_text(x, json.dumps(extra_pnginfo[x]))
+
+        saved = []
+        for (batch_number, image) in enumerate(images):
+            i = 255. * image.cpu().numpy()
+            img = Image.fromarray(np.clip(i, 0, 255).astype(np.uint8))
+            buf = Bio.BytesIO()
+            img.save(buf, format="png", pnginfo=None, compress_level=self.compress_level)
+            saved.append(buf.getvalue())
+
+        payload = {
+            "images": saved,
+            "filename_prefix": server_filename_prefix,
+            "width0": images[0].shape[1],
+            "height0": images[0].shape[0],
+            "metadata": metadata,
+            "compress_level": self.compress_level,
+        }
+
+        request(
+            f"{server_url}/icern/save__image_to_disk",
+            payload,
+            timeout_seconds,
+        )
+        
+        return (images,)
+
 NODE_CLASS_MAPPINGS = {
     "RemoteCLIPLoader": RemoteCLIPLoader,
     "RemoteVAELoader": RemoteVAELoader,
     "RemoteMiniMaxH3ImageAndReferenceToVideo": RemoteMiniMaxH3ImageAndReferenceToVideo,
     "RemoteVAEDecodeVideo": RemoteVAEDecodeVideo,
+    "SaveImageToRemoteDisk": SaveImageToRemoteDisk,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "RemoteCLIPLoader": "Remote CLIP Loader",
     "RemoteVAELoader": "Remote VAE Loader",
-    "RemoteMiniMaxH3ImageAndReferenceToVideo": "Remote MiniMaxH3ImageAndReferenceToVideo",
+    "RemoteMiniMaxH3ImageAndReferenceToVideo": "Remote/Local MiniMax H3 Image + Reference to Video",
     "RemoteVAEDecodeVideo": "Remote VAE Decode Video",
+    "SaveImageToRemoteDisk": "Save Image To Remote Disk",
 }
